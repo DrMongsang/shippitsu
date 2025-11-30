@@ -403,47 +403,126 @@ function copyWithPerformanceMonitoring() {
 }
 
 /**
- * 元データの更新を検知したらコピーを実行する（11:30以降のみ）
+ * 元データの更新を検知したらコピーを実行する（改善版）
+ * データ内容のハッシュを比較して変更を検知
  * これを時間主導トリガー（例: 15分おき/30分おき）に設定すると、更新があったタイミングで一度だけ走る
  */
 function copyIfSourceUpdated() {
   const SOURCE_SPREADSHEET_ID = '1qfLWv1Hs0ys8_HxFAwDBiyTfgO7gJfIB6p3aOk7Vqes';
+  const SOURCE_SHEET_NAME = 'DB_予約';
+  const ENABLE_TIME_RESTRICTION = false; // 時間制限を有効にする場合はtrue
 
   const now = new Date();
-  const isAfter1130 = (now.getHours() > 11) || (now.getHours() === 11 && now.getMinutes() >= 30);
-  if (!isAfter1130) {
-    Logger.log('⏳ 11:30以降に実行する想定のため、今回はスキップします');
-    return;
+
+  // 時間制限のチェック（必要に応じて）
+  if (ENABLE_TIME_RESTRICTION) {
+    const isAfter1130 = (now.getHours() > 11) || (now.getHours() === 11 && now.getMinutes() >= 30);
+    if (!isAfter1130) {
+      Logger.log('⏳ 11:30以降に実行する想定のため、今回はスキップします');
+      return;
+    }
   }
 
   try {
-    const props = PropertiesService.getScriptProperties();
-    const file = DriveApp.getFileById(SOURCE_SPREADSHEET_ID);
-    const updated = file.getLastUpdated();
-    const lastProcessedIso = props.getProperty('LAST_SRC_UPDATED');
-    const lastProcessed = lastProcessedIso ? new Date(lastProcessedIso) : null;
+    Logger.log(`🔍 元データの更新確認を開始します [${now.toLocaleString()}]`);
 
-    Logger.log(`🕒 元データの更新時刻: ${updated.toLocaleString()}`);
-    if (lastProcessed) {
-      Logger.log(`🕒 前回処理時刻: ${lastProcessed.toLocaleString()}`);
+    const props = PropertiesService.getScriptProperties();
+
+    // スプレッドシートを開いてデータの「指紋」を取得
+    const srcSs = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+    const srcSheet = srcSs.getSheetByName(SOURCE_SHEET_NAME);
+
+    if (!srcSheet) {
+      Logger.log(`❌ シート '${SOURCE_SHEET_NAME}' が見つかりません`);
+      return;
     }
 
-    if (lastProcessed && lastProcessed.getTime() >= updated.getTime()) {
+    // データの最終行を取得
+    const lastRow = srcSheet.getLastRow();
+    const lastCol = srcSheet.getLastColumn();
+
+    // データ指紋を作成（行数・列数・最終更新時刻・サンプルデータのハッシュ）
+    let dataFingerprint = `${lastRow}:${lastCol}`;
+
+    // 最初の数行と最後の数行をサンプルとして取得してハッシュ化
+    if (lastRow > 0 && lastCol > 0) {
+      try {
+        // 最初の5行（またはデータ全体が5行未満の場合は全部）
+        const sampleSize = Math.min(5, lastRow);
+        const topSample = srcSheet.getRange(1, 1, sampleSize, Math.min(3, lastCol)).getValues();
+
+        // 最後の5行
+        if (lastRow > 5) {
+          const bottomStart = lastRow - 4; // 最後の5行
+          const bottomSample = srcSheet.getRange(bottomStart, 1, 5, Math.min(3, lastCol)).getValues();
+          dataFingerprint += `:${JSON.stringify(topSample)}:${JSON.stringify(bottomSample)}`;
+        } else {
+          dataFingerprint += `:${JSON.stringify(topSample)}`;
+        }
+      } catch (sampleError) {
+        Logger.log(`⚠️ サンプルデータ取得エラー: ${sampleError.message}`);
+        // サンプル取得失敗時は行数・列数のみで判定
+      }
+    }
+
+    // ファイルの最終更新時刻も取得
+    const file = DriveApp.getFileById(SOURCE_SPREADSHEET_ID);
+    const fileUpdated = file.getLastUpdated();
+    dataFingerprint += `:${fileUpdated.getTime()}`;
+
+    // 前回の指紋と比較
+    const lastFingerprint = props.getProperty('LAST_DATA_FINGERPRINT');
+
+    Logger.log(`📊 データ情報: ${lastRow}行 × ${lastCol}列`);
+    Logger.log(`🕒 ファイル最終更新: ${fileUpdated.toLocaleString()}`);
+
+    if (lastFingerprint === dataFingerprint) {
       Logger.log('ℹ️ 元データに変更なし。コピーをスキップします');
       return;
     }
 
-    // 更新あり → コピー実行
-    Logger.log('🔄 元データの更新を検知。コピーを開始します');
+    Logger.log('🔄 元データの更新を検知しました');
+    if (lastFingerprint) {
+      Logger.log(`   前回の指紋: ${lastFingerprint.substring(0, 100)}...`);
+      Logger.log(`   今回の指紋: ${dataFingerprint.substring(0, 100)}...`);
+    } else {
+      Logger.log('   (初回実行のため前回データなし)');
+    }
+
+    // コピー実行
+    Logger.log('📋 データコピーを開始します');
     copyVisitDataToMySheet_Stable();
 
-    // 更新時刻を保存（次回以降の不要実行を防止）
-    props.setProperty('LAST_SRC_UPDATED', updated.toISOString());
+    // 成功したら指紋を保存
+    props.setProperty('LAST_DATA_FINGERPRINT', dataFingerprint);
+    props.setProperty('LAST_SRC_UPDATED', new Date().toISOString());
     Logger.log('✅ 元データの更新を検知し、コピーを完了しました');
 
   } catch (error) {
     Logger.log(`❌ copyIfSourceUpdated でエラーが発生: ${error.message}`);
+    Logger.log(`📍 スタック: ${error.stack || '(スタックトレースなし)'}`);
     // エラー時も次回実行できるよう、再スローしない
+  }
+}
+
+/**
+ * 強制的にコピーを実行する（更新検知をスキップ）
+ * 手動実行やテスト用
+ */
+function forceUpdateNow() {
+  Logger.log('🔧 強制コピーモード: 更新検知をスキップして実行します');
+
+  try {
+    copyVisitDataToMySheet_Stable();
+
+    // 完了後に指紋を更新
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty('LAST_SRC_UPDATED', new Date().toISOString());
+    Logger.log('✅ 強制コピーが完了しました');
+
+  } catch (error) {
+    Logger.log(`❌ 強制コピー中にエラーが発生: ${error.message}`);
+    throw error;
   }
 }
 
@@ -465,6 +544,7 @@ function resetCheckpoint() {
   props.deleteProperty('COPY_SOURCE_FP');
   props.deleteProperty('COPY_OFFSET');
   props.deleteProperty('LAST_SRC_UPDATED');
+  props.deleteProperty('LAST_DATA_FINGERPRINT');
   Logger.log('🔄 すべてのチェックポイントをリセットしました');
 }
 
