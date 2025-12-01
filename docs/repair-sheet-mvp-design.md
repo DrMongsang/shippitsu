@@ -72,6 +72,9 @@ Phase 1として、お直し管理の基本機能を持つWebアプリケーシ�
 - 顧客名（テキスト入力）
 - 注文詳細ID（テキスト入力）
 - 来店日時（日付ピッカー）
+- **サポート区分**（ラジオボタン）:
+  - ○ サポート内（無料）
+  - ○ サポート外（有料）
 
 #### ステップ2: アイテム選択
 - アイテムタイプ選択（ボタン選択）
@@ -110,9 +113,28 @@ Phase 1として、お直し管理の基本機能を持つWebアプリケーシ�
   - 納期リアルタイム表示
 
 #### ステップ4: 原因分析
-- お客様のご要望（テキストエリア）
-- 体型変動の有無（ラジオボタン: あり / なし）
-- お直しが起きた原因（テキストエリア）
+- **お客様のご要望**（テキストエリア + テンプレート選択）
+  - テンプレート選択ドロップダウン:
+    - 「サイズが合わない」
+    - 「シルエットを変更したい」
+    - 「体型に合わせて調整したい」
+    - 「その他」
+  - 選択すると自動的にテキストエリアに挿入
+  - 自由に編集可能
+
+- **体型変動の有無**（ラジオボタン）:
+  - ○ あり / ○ なし
+
+- **お直しが起きた原因**（テキストエリア + テンプレート選択）
+  - テンプレート選択ドロップダウン:
+    - 「お客様のご要望による変更」
+    - 「体型変化による調整」
+    - 「ヒアリング不足」
+    - 「要望のすり合わせ不足」
+    - 「採寸ミス」
+    - 「その他」
+  - 選択すると自動的にテキストエリアに挿入
+  - 自由に編集可能
 
 #### ステップ5: 備考
 - 備考・エピソード（テキストエリア）
@@ -179,6 +201,8 @@ model RepairRecord {
   customerName   String   // 顧客名
   orderDetailId  String?  // 注文詳細ID
   visitDate      DateTime // 来店日時
+  supportType    String   @default("within") // サポート区分: "within" | "outside"
+  status         String   @default("in_progress") // ステータス: "in_progress" | "completed"
 
   // お直し詳細（JSON）
   items          Json     // RepairItem[]
@@ -192,7 +216,7 @@ model RepairRecord {
   notes          String? @db.Text
 
   // 計算結果
-  totalCost      Float    // 総額（税込）
+  totalCost      Float    // 総額（税込）※サポート内の場合は0
   deliveryDate   DateTime // 納期
 
   // 作成者
@@ -202,6 +226,7 @@ model RepairRecord {
   @@index([store])
   @@index([customerName])
   @@index([visitDate])
+  @@index([status])
 }
 
 // お直し限界値マスタ
@@ -254,12 +279,17 @@ export interface Adjustment {
   limitMax: number          // 最大変更値
 }
 
+export type SupportType = 'within' | 'outside' // サポート内 | サポート外
+export type RepairRecordStatus = 'in_progress' | 'completed' // 対応中 | 完了
+
 export interface RepairFormData {
   // 基本情報
   store: string
   customerName: string
   orderDetailId?: string
   visitDate: Date
+  supportType: SupportType
+  status: RepairRecordStatus
 
   // お直し詳細
   items: RepairItem[]
@@ -349,7 +379,16 @@ export function countRepairPoints(items: RepairItem[]): number {
 ### 5.3 料金計算
 
 ```typescript
-export function calculateTotalCost(items: RepairItem[]): number {
+export function calculateTotalCost(
+  items: RepairItem[],
+  supportType: SupportType
+): number {
+  // サポート内の場合は無料
+  if (supportType === 'within') {
+    return 0
+  }
+
+  // サポート外の場合は通常通り計算
   let total = 0
 
   items.forEach((item) => {
