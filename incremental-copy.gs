@@ -210,44 +210,43 @@ function copyIfSourceUpdatedIncremental() {
     const lastRow = srcSheet.getLastRow();
     const lastCol = srcSheet.getLastColumn();
 
-    // データ指紋を作成
+    Logger.log(`📊 データ情報: ${lastRow}行 × ${lastCol}列`);
+
+    // データ指紋を作成（行数・列数・最終行のサンプルデータ）
+    // ファイル更新時刻は使わない（データ追加時に更新されないことがあるため）
     let dataFingerprint = `${lastRow}:${lastCol}`;
 
     if (lastRow > 0 && lastCol > 0) {
       try {
+        // 最後の5行をサンプルとして取得（新規データは最後に追加されるため）
         const sampleSize = Math.min(5, lastRow);
-        const topSample = srcSheet.getRange(1, 1, sampleSize, Math.min(3, lastCol)).getValues();
-
-        if (lastRow > 5) {
-          const bottomStart = lastRow - 4;
-          const bottomSample = srcSheet.getRange(bottomStart, 1, 5, Math.min(3, lastCol)).getValues();
-          dataFingerprint += `:${JSON.stringify(topSample)}:${JSON.stringify(bottomSample)}`;
-        } else {
-          dataFingerprint += `:${JSON.stringify(topSample)}`;
-        }
+        const sampleStart = lastRow - sampleSize + 1;
+        const bottomSample = srcSheet.getRange(sampleStart, 1, sampleSize, Math.min(3, lastCol)).getValues();
+        dataFingerprint += `:${JSON.stringify(bottomSample)}`;
       } catch (sampleError) {
         Logger.log(`⚠️ サンプルデータ取得エラー: ${sampleError.message}`);
+        // サンプル取得失敗時は行数・列数のみで判定
       }
     }
 
-    const file = DriveApp.getFileById(SOURCE_SPREADSHEET_ID);
-    const fileUpdated = file.getLastUpdated();
-    dataFingerprint += `:${fileUpdated.getTime()}`;
-
     const lastFingerprint = props.getProperty('LAST_DATA_FINGERPRINT_INCREMENTAL');
-
-    Logger.log(`📊 データ情報: ${lastRow}行 × ${lastCol}列`);
-    Logger.log(`🕒 ファイル最終更新: ${fileUpdated.toLocaleString()}`);
 
     if (lastFingerprint === dataFingerprint) {
       Logger.log('ℹ️ 元データに変更なし。コピーをスキップします');
       return;
     }
 
-    Logger.log('🔄 元データの更新を検知しました');
+    Logger.log('🔄 元データの更新を検知しました！');
     if (lastFingerprint) {
-      Logger.log(`   前回の指紋: ${lastFingerprint.substring(0, 100)}...`);
-      Logger.log(`   今回の指紋: ${dataFingerprint.substring(0, 100)}...`);
+      // 行数の変化を表示
+      const prevParts = lastFingerprint.split(':');
+      const prevRows = parseInt(prevParts[0]) || 0;
+      const increase = lastRow - prevRows;
+      Logger.log(`   前回データ: ${prevRows}行`);
+      Logger.log(`   今回データ: ${lastRow}行`);
+      if (increase > 0) {
+        Logger.log(`   ✨ 新規追加: +${increase}行`);
+      }
     } else {
       Logger.log('   (初回実行のため前回データなし)');
     }
