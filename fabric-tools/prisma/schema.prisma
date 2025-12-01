@@ -1,0 +1,87 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ユーザー（スタッフ）
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  image     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  repairs   RepairRecord[]
+}
+
+// お直し記録
+model RepairRecord {
+  id             String   @id @default(cuid())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // 基本情報
+  store          String   // 店舗名
+  customerName   String   // 顧客名
+  orderDetailId  String?  // 注文詳細ID
+  visitDate      DateTime // 来店日時
+  supportType    String   @default("within") // サポート区分: "within" | "outside"
+  status         String   @default("in_progress") // ステータス: "in_progress" | "completed"
+
+  // お直し詳細（JSON）
+  items          Json     // RepairItem[]
+
+  // 原因分析
+  customerRequest String? @db.Text // お客様のご要望
+  bodyChange      Boolean @default(false) // 体型変動
+  rootCause       String? @db.Text // 原因
+
+  // 備考
+  notes          String? @db.Text
+
+  // 計算結果
+  totalCost      Float    // 総額（税込）※サポート内の場合は0
+  deliveryDate   DateTime // 納期
+
+  // 作成者
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+
+  @@index([store])
+  @@index([customerName])
+  @@index([visitDate])
+  @@index([status])
+}
+
+// お直し限界値マスタ
+model RepairLimit {
+  id            String   @id @default(cuid())
+  itemType      String   // アイテムタイプ（jacket, pants, shirt, vest, chino）
+  part          String   // 部位（shoulderWidth, bust, waist, etc.）
+  partLabel     String   // 表示名（肩幅、バスト、ウエストなど）
+  minChange     Float    // 最小変更値（cm）
+  maxChange     Float    // 最大変更値（cm）
+  unitPrice     Float    // 単価（税込）
+  deliveryDays  Int      // 納期（日数）
+  description   String?  // 説明
+
+  @@unique([itemType, part])
+}
+
+// 店舗マスタ
+model Store {
+  id          String   @id @default(cuid())
+  code        String   @unique // 店舗コード（shinjuku1, kichijoji, etc.）
+  name        String   // 店舗名（新宿1、吉祥寺、など）
+  region      String   // 地域（関東EAST、関東WEST、など）
+  phoneNumber String?
+  active      Boolean  @default(true)
+}
