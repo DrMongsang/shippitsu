@@ -1,7 +1,7 @@
 /**
  * IMPORT RANGEの代替スクリプト (A列B列を下からチェックして最終行を特定する高速版)
  * ★安定性向上版 - リトライ機能・詳細エラーハンドリング・レート制限対応
- * 改善版: タイムアウト対策・ロック処理の修正・レート制限の強化
+ * 改善版v2: チャンクサイズ削減・メモリ解放・自動再開トリガー・flush追加
  */
 
 function copyVisitDataToMySheet_Stable() {
@@ -11,11 +11,12 @@ function copyVisitDataToMySheet_Stable() {
   const DEST_SPREADSHEET_ID = '18L7Pv605gE33CUHaDayG4FdDIMSBlV7dDpuGgcjDk8I'; // コピー先のスプレッドシートID
   const DEST_SHEET_NAME = 'DB_予約'; // コピー先のシート名
 
-  const CHUNK_SIZE = 300; // 一度に運ぶ行数（安定性のためさらに小さく設定）
+  const CHUNK_SIZE = 100; // 一度に運ぶ行数（メモリとレート制限を考慮して小さく）
   const MAX_RETRIES = 3; // 最大リトライ回数
-  const BASE_DELAY = 1500; // 基本待機時間（ミリ秒）
-  const OPERATION_DELAY = 500; // 操作間の待機時間（ミリ秒）
+  const BASE_DELAY = 2000; // 基本待機時間（ミリ秒）
+  const OPERATION_DELAY = 800; // 操作間の待機時間（ミリ秒）
   const MAX_EXECUTION_TIME = 300000; // 最大実行時間 5分（GASの6分制限を考慮）
+  const AUTO_RESUME = true; // タイムアウト時に自動再開トリガーを作成
   // ==============
 
   // ロック変数をtryブロックの外で定義（finallyでアクセス可能にする）
@@ -130,7 +131,7 @@ function copyVisitDataToMySheet_Stable() {
           const actualStart = Math.max(1, batchStart - BATCH_SIZE + 1);
           const actualSize = batchStart - actualStart + 1;
 
-          const values = srcSheet.getRange(actualStart, 1, actualSize, 2).getValues();
+          let values = srcSheet.getRange(actualStart, 1, actualSize, 2).getValues();
 
           for (let i = values.length - 1; i >= 0; i--) {
             if (values[i][0] !== '' || values[i][1] !== '') {
@@ -138,6 +139,9 @@ function copyVisitDataToMySheet_Stable() {
               break;
             }
           }
+
+          // メモリ解放
+          values = null;
 
           if (lastRow > 0) break;
         }
@@ -218,8 +222,10 @@ function copyVisitDataToMySheet_Stable() {
       const chunkIndex = Math.floor((start - 1) / CHUNK_SIZE) + 1;
       const chunkSize = Math.min(CHUNK_SIZE, lastRowWithData - start + 1);
 
+      Logger.log(`🔄 チャンク ${chunkIndex}/${totalChunks} を処理中...`);
+
       // ソースからチャンクを取得（レート制限対策の待機付き）
-      const chunk = safeSpreadsheetOperation(
+      let chunk = safeSpreadsheetOperation(
         () => srcSheet.getRange(start, 1, chunkSize, colCount).getValues(),
         `チャンク ${chunkIndex}/${totalChunks} (${start}～${start + chunkSize - 1}行目) の取得`
       );
@@ -232,16 +238,21 @@ function copyVisitDataToMySheet_Stable() {
         () => {
           const targetRange = destSheet.getRange(start, 1, chunkSize, colCount);
           targetRange.setValues(chunk);
+          SpreadsheetApp.flush(); // 書き込みを確実にフラッシュ
           return true;
         },
         `チャンク ${chunkIndex}/${totalChunks} (${start}～${start + chunkSize - 1}行目) の書き込み`
       );
 
+      // メモリ解放
+      chunk = null;
+
       // チェックポイント更新
       totalProcessed += chunkSize;
       props.setProperty('COPY_OFFSET', String(start + chunkSize - 1));
       const progress = Math.round((totalProcessed / lastRowWithData) * 100);
-      Logger.log(`📊 進捗: ${progress}% (${totalProcessed}/${lastRowWithData}行) 完了`);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      Logger.log(`📊 進捗: ${progress}% (${totalProcessed}/${lastRowWithData}行) 完了 [経過時間: ${elapsed}秒]`);
 
       // レート制限対策の待機（最後のチャンク以外）
       if (start + CHUNK_SIZE <= lastRowWithData) {
@@ -254,6 +265,13 @@ function copyVisitDataToMySheet_Stable() {
     props.deleteProperty('COPY_SOURCE_FP');
     props.deleteProperty('COPY_OFFSET');
 
+    // 完了時は自動再開トリガーもクリーンアップ
+    try {
+      deleteResumeTriggers();
+    } catch (triggerError) {
+      Logger.log(`⚠️ トリガークリーンアップ時のエラー（無視可能）: ${triggerError.message}`);
+    }
+
     const totalTime = (Date.now() - startTime) / 1000;
     Logger.log(`🎉 データコピー完了: ${lastRowWithData}行 × ${colCount}列 を正常に転送しました`);
     Logger.log(`📈 処理統計: ${totalChunks}チャンクに分割して実行（実行時間: ${totalTime.toFixed(2)}秒）`);
@@ -265,9 +283,18 @@ function copyVisitDataToMySheet_Stable() {
     Logger.log(`📍 エラー発生箇所: ${e.stack || '(スタックトレースなし)'}`);
     Logger.log(`🔧 対処法: スプレッドシートの権限、ネットワーク接続、API制限を確認してください`);
 
-    // タイムアウトエラーの場合は次回再開可能な旨を通知
+    // タイムアウトエラーの場合は自動再開トリガーを作成
     if (e.message && e.message.includes('実行時間制限')) {
       Logger.log(`⏱️ タイムアウトによる中断。次回実行時に続きから再開されます。`);
+
+      if (AUTO_RESUME) {
+        try {
+          createResumeTimer();
+          Logger.log(`🔄 自動再開トリガーを作成しました（1分後に再開）`);
+        } catch (triggerError) {
+          Logger.log(`⚠️ 自動再開トリガーの作成に失敗: ${triggerError.message}`);
+        }
+      }
     }
 
     // エラーを再スローして呼び出し元にも通知
@@ -376,47 +403,126 @@ function copyWithPerformanceMonitoring() {
 }
 
 /**
- * 元データの更新を検知したらコピーを実行する（11:30以降のみ）
+ * 元データの更新を検知したらコピーを実行する（改善版）
+ * データ内容のハッシュを比較して変更を検知
  * これを時間主導トリガー（例: 15分おき/30分おき）に設定すると、更新があったタイミングで一度だけ走る
  */
 function copyIfSourceUpdated() {
   const SOURCE_SPREADSHEET_ID = '1qfLWv1Hs0ys8_HxFAwDBiyTfgO7gJfIB6p3aOk7Vqes';
+  const SOURCE_SHEET_NAME = 'DB_予約';
+  const ENABLE_TIME_RESTRICTION = false; // 時間制限を有効にする場合はtrue
 
   const now = new Date();
-  const isAfter1130 = (now.getHours() > 11) || (now.getHours() === 11 && now.getMinutes() >= 30);
-  if (!isAfter1130) {
-    Logger.log('⏳ 11:30以降に実行する想定のため、今回はスキップします');
-    return;
+
+  // 時間制限のチェック（必要に応じて）
+  if (ENABLE_TIME_RESTRICTION) {
+    const isAfter1130 = (now.getHours() > 11) || (now.getHours() === 11 && now.getMinutes() >= 30);
+    if (!isAfter1130) {
+      Logger.log('⏳ 11:30以降に実行する想定のため、今回はスキップします');
+      return;
+    }
   }
 
   try {
-    const props = PropertiesService.getScriptProperties();
-    const file = DriveApp.getFileById(SOURCE_SPREADSHEET_ID);
-    const updated = file.getLastUpdated();
-    const lastProcessedIso = props.getProperty('LAST_SRC_UPDATED');
-    const lastProcessed = lastProcessedIso ? new Date(lastProcessedIso) : null;
+    Logger.log(`🔍 元データの更新確認を開始します [${now.toLocaleString()}]`);
 
-    Logger.log(`🕒 元データの更新時刻: ${updated.toLocaleString()}`);
-    if (lastProcessed) {
-      Logger.log(`🕒 前回処理時刻: ${lastProcessed.toLocaleString()}`);
+    const props = PropertiesService.getScriptProperties();
+
+    // スプレッドシートを開いてデータの「指紋」を取得
+    const srcSs = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+    const srcSheet = srcSs.getSheetByName(SOURCE_SHEET_NAME);
+
+    if (!srcSheet) {
+      Logger.log(`❌ シート '${SOURCE_SHEET_NAME}' が見つかりません`);
+      return;
     }
 
-    if (lastProcessed && lastProcessed.getTime() >= updated.getTime()) {
+    // データの最終行を取得
+    const lastRow = srcSheet.getLastRow();
+    const lastCol = srcSheet.getLastColumn();
+
+    // データ指紋を作成（行数・列数・最終更新時刻・サンプルデータのハッシュ）
+    let dataFingerprint = `${lastRow}:${lastCol}`;
+
+    // 最初の数行と最後の数行をサンプルとして取得してハッシュ化
+    if (lastRow > 0 && lastCol > 0) {
+      try {
+        // 最初の5行（またはデータ全体が5行未満の場合は全部）
+        const sampleSize = Math.min(5, lastRow);
+        const topSample = srcSheet.getRange(1, 1, sampleSize, Math.min(3, lastCol)).getValues();
+
+        // 最後の5行
+        if (lastRow > 5) {
+          const bottomStart = lastRow - 4; // 最後の5行
+          const bottomSample = srcSheet.getRange(bottomStart, 1, 5, Math.min(3, lastCol)).getValues();
+          dataFingerprint += `:${JSON.stringify(topSample)}:${JSON.stringify(bottomSample)}`;
+        } else {
+          dataFingerprint += `:${JSON.stringify(topSample)}`;
+        }
+      } catch (sampleError) {
+        Logger.log(`⚠️ サンプルデータ取得エラー: ${sampleError.message}`);
+        // サンプル取得失敗時は行数・列数のみで判定
+      }
+    }
+
+    // ファイルの最終更新時刻も取得
+    const file = DriveApp.getFileById(SOURCE_SPREADSHEET_ID);
+    const fileUpdated = file.getLastUpdated();
+    dataFingerprint += `:${fileUpdated.getTime()}`;
+
+    // 前回の指紋と比較
+    const lastFingerprint = props.getProperty('LAST_DATA_FINGERPRINT');
+
+    Logger.log(`📊 データ情報: ${lastRow}行 × ${lastCol}列`);
+    Logger.log(`🕒 ファイル最終更新: ${fileUpdated.toLocaleString()}`);
+
+    if (lastFingerprint === dataFingerprint) {
       Logger.log('ℹ️ 元データに変更なし。コピーをスキップします');
       return;
     }
 
-    // 更新あり → コピー実行
-    Logger.log('🔄 元データの更新を検知。コピーを開始します');
+    Logger.log('🔄 元データの更新を検知しました');
+    if (lastFingerprint) {
+      Logger.log(`   前回の指紋: ${lastFingerprint.substring(0, 100)}...`);
+      Logger.log(`   今回の指紋: ${dataFingerprint.substring(0, 100)}...`);
+    } else {
+      Logger.log('   (初回実行のため前回データなし)');
+    }
+
+    // コピー実行
+    Logger.log('📋 データコピーを開始します');
     copyVisitDataToMySheet_Stable();
 
-    // 更新時刻を保存（次回以降の不要実行を防止）
-    props.setProperty('LAST_SRC_UPDATED', updated.toISOString());
+    // 成功したら指紋を保存
+    props.setProperty('LAST_DATA_FINGERPRINT', dataFingerprint);
+    props.setProperty('LAST_SRC_UPDATED', new Date().toISOString());
     Logger.log('✅ 元データの更新を検知し、コピーを完了しました');
 
   } catch (error) {
     Logger.log(`❌ copyIfSourceUpdated でエラーが発生: ${error.message}`);
+    Logger.log(`📍 スタック: ${error.stack || '(スタックトレースなし)'}`);
     // エラー時も次回実行できるよう、再スローしない
+  }
+}
+
+/**
+ * 強制的にコピーを実行する（更新検知をスキップ）
+ * 手動実行やテスト用
+ */
+function forceUpdateNow() {
+  Logger.log('🔧 強制コピーモード: 更新検知をスキップして実行します');
+
+  try {
+    copyVisitDataToMySheet_Stable();
+
+    // 完了後に指紋を更新
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty('LAST_SRC_UPDATED', new Date().toISOString());
+    Logger.log('✅ 強制コピーが完了しました');
+
+  } catch (error) {
+    Logger.log(`❌ 強制コピー中にエラーが発生: ${error.message}`);
+    throw error;
   }
 }
 
@@ -438,5 +544,84 @@ function resetCheckpoint() {
   props.deleteProperty('COPY_SOURCE_FP');
   props.deleteProperty('COPY_OFFSET');
   props.deleteProperty('LAST_SRC_UPDATED');
+  props.deleteProperty('LAST_DATA_FINGERPRINT');
   Logger.log('🔄 すべてのチェックポイントをリセットしました');
+}
+
+/**
+ * 自動再開用のトリガーを作成する
+ * タイムアウト時に1分後に自動的に続きから実行するためのトリガー
+ */
+function createResumeTimer() {
+  // 既存の再開トリガーを削除
+  deleteResumeTriggers();
+
+  // 1分後に実行するトリガーを作成
+  ScriptApp.newTrigger('copyVisitDataToMySheet_Stable')
+    .timeBased()
+    .after(60 * 1000) // 60秒後
+    .create();
+
+  Logger.log('⏰ 自動再開トリガーを作成しました（60秒後に実行）');
+}
+
+/**
+ * 既存の再開トリガーをすべて削除する
+ */
+function deleteResumeTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let deletedCount = 0;
+
+  for (const trigger of triggers) {
+    if (trigger.getHandlerFunction() === 'copyVisitDataToMySheet_Stable') {
+      ScriptApp.deleteTrigger(trigger);
+      deletedCount++;
+    }
+  }
+
+  if (deletedCount > 0) {
+    Logger.log(`🗑️ ${deletedCount}個の既存トリガーを削除しました`);
+  }
+}
+
+/**
+ * 手動で再開トリガーを削除する（デバッグ用）
+ */
+function cleanupTriggers() {
+  deleteResumeTriggers();
+  Logger.log('✅ すべての自動再開トリガーを削除しました');
+}
+
+/**
+ * 現在の処理状態を確認する（デバッグ用）
+ */
+function checkStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const runId = props.getProperty('COPY_RUN_ID');
+  const offset = props.getProperty('COPY_OFFSET');
+  const sourceFP = props.getProperty('COPY_SOURCE_FP');
+
+  Logger.log('📊 現在の処理状態:');
+  if (runId) {
+    Logger.log(`  Run ID: ${runId}`);
+    Logger.log(`  処理済み行: ${offset || '0'}`);
+    Logger.log(`  ソース指紋: ${sourceFP || 'なし'}`);
+
+    if (sourceFP) {
+      const parts = sourceFP.split(':');
+      if (parts.length >= 3) {
+        const totalRows = parseInt(parts[2], 10);
+        const currentOffset = parseInt(offset || '0', 10);
+        const progress = Math.round((currentOffset / totalRows) * 100);
+        Logger.log(`  進捗率: ${progress}% (${currentOffset}/${totalRows}行)`);
+      }
+    }
+  } else {
+    Logger.log('  処理は実行されていないか、完了しています');
+  }
+
+  // トリガーの状態も確認
+  const triggers = ScriptApp.getProjectTriggers();
+  const resumeTriggers = triggers.filter(t => t.getHandlerFunction() === 'copyVisitDataToMySheet_Stable');
+  Logger.log(`  アクティブな自動再開トリガー: ${resumeTriggers.length}個`);
 }
